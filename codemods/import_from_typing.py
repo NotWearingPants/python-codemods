@@ -10,16 +10,16 @@ class Run(VisitorBasedCodemodCommand):
 	def leave_Import(
 		self, original_node: libcst.Import, updated_node: libcst.Import
 	) -> libcst.CSTNode:
-		for name in original_node.names:
+		for name in updated_node.names:
 			if name.name.value == 'typing':
 				return libcst.RemoveFromParent()
 
-		return original_node
+		return updated_node
 
 	def leave_Attribute(
 		self, original_node: libcst.Attribute, updated_node: libcst.Attribute
 	) -> libcst.CSTNode:
-		match original_node:
+		match updated_node:
 			case libcst.Attribute(
 				value=libcst.Name(value='typing'),
 				attr=libcst.Name(value=value) as attr,
@@ -27,4 +27,4 @@ class Run(VisitorBasedCodemodCommand):
 				AddImportsVisitor.add_needed_import(self.context, 'typing', value)
 				return attr
 
-		return original_node
+		return updated_node
