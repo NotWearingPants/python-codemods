@@ -1,10 +1,12 @@
-# replace `import typing` with `from typing import ...`
-
 import libcst
 from libcst.codemod import VisitorBasedCodemodCommand
 from libcst.codemod.visitors import AddImportsVisitor
 
 class Run(VisitorBasedCodemodCommand):
+	DESCRIPTION = '''
+		Replace `import typing` with `from typing import ...`
+	'''
+
 	def leave_Import(
 		self, original_node: libcst.Import, updated_node: libcst.Import
 	) -> libcst.CSTNode:
