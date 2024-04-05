@@ -1,6 +1,7 @@
 import libcst
 from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
 from libcst.codemod.visitors import AddImportsVisitor
+from libcst.metadata import Scope, ScopeProvider, scope_provider
 
 # https://docs.python.org/3/library/typing.html#deprecated-aliases
 # https://peps.python.org/pep-0585/
@@ -51,6 +52,21 @@ DEPRECATED_TYPES_REPLACEMENTS = {
 	'typing.re.Match': 're.Match',
 }
 
+def get_qualified_imported_name(scope: Scope, node: libcst.CSTNode) -> str | None:
+	qualified_names = scope.get_qualified_names_for(node)
+
+	# this ignores some imports (e.g. inside `try-except`),
+	# they're harder to deal with but we probably don't care about them
+	if len(qualified_names) != 1:
+		return None
+
+	qualified_name = next(iter(qualified_names))
+
+	if qualified_name.source != scope_provider.QualifiedNameSource.IMPORT:
+		return None
+
+	return qualified_name.name
+
 # TODO: implement https://github.com/Instagram/LibCST/issues/341#issuecomment-662156212
 #       because `2 * Union[3, 4]` should become `2 * (3 + 4)` and not `2 * 3 + 4`.
 #       currently the `T1 | (T2 | T3)` -> `T1 | T2 | T3` step is not necessary
@@ -65,70 +81,75 @@ class Run(VisitorBasedCodemodCommand):
 		Doesn't remove imports that become unused (e.g. `from typing import Dict`).
 	'''
 
+	METADATA_DEPENDENCIES = (ScopeProvider,)
+
 	def __init__(self, context: CodemodContext) -> None:
 		super().__init__(context)
-		self.node_to_qualified_name = {}
+		self.inside_type_annotation = False
+
+	def enter_Annotation(
+		self, original_node: libcst.Annotation, updated_node: libcst.Annotation
+	) -> libcst.CSTNode:
+		self.inside_type_annotation = True
+		return updated_node
+
+	def leave_Annotation(
+		self, original_node: libcst.Annotation, updated_node: libcst.Annotation
+	) -> libcst.CSTNode:
+		# annotations can't be nested
+		self.inside_type_annotation = False
+		return updated_node
 
 	def leave_Subscript(
 		self, original_node: libcst.Subscript, updated_node: libcst.Subscript
 	) -> libcst.CSTNode:
+		scope = self.get_metadata(ScopeProvider, original_node)
+
 		# `Optional[T]` -> `T | None`
 		match updated_node:
 			case libcst.Subscript(
-				value=(
-					libcst.Name(value='Optional')
-					|
-					libcst.Attribute(
-						value=libcst.Name(value='typing'),
-						attr=libcst.Name(value='Optional'),
-					)
-				),
+				value=(libcst.Name() | libcst.Attribute()) as type_reference,
 				slice=(
 					libcst.SubscriptElement(
 						slice=libcst.Index(value),
 					),
 				),
 			):
-				return libcst.BinaryOperation(
-					left=value,
-					operator=libcst.BitOr(),
-					right=libcst.Name(value='None'),
-				)
+				if get_qualified_imported_name(scope, type_reference) == 'typing.Optional':
+					return libcst.BinaryOperation(
+						left=value,
+						operator=libcst.BitOr(),
+						right=libcst.Name(value='None'),
+					)
 
 		# `Union[T1, T2]` -> `T1 | T2`
 		match updated_node:
 			case libcst.Subscript(
-				value=(
-					libcst.Name(value='Union')
-					|
-					libcst.Attribute(
-						value=libcst.Name(value='typing'),
-						attr=libcst.Name(value='Union'),
-					)
-				),
+				value=(libcst.Name() | libcst.Attribute()) as type_reference,
 				slice=types,
 			):
-				replacement = None
+				if get_qualified_imported_name(scope, type_reference) == 'typing.Union':
+					replacement = None
 
-				for type in types:
-					match type:
-						case libcst.SubscriptElement(
-							slice=libcst.Index(value),
-						):
-							replacement = libcst.BinaryOperation(
-								left=replacement,
-								operator=libcst.BitOr(),
-								right=value,
-							) if replacement else value
+					for type in types:
+						match type:
+							case libcst.SubscriptElement(
+								slice=libcst.Index(value),
+							):
+								replacement = libcst.BinaryOperation(
+									left=replacement,
+									operator=libcst.BitOr(),
+									right=value,
+								) if replacement else value
 
-						case _:
-							return updated_node
+							case _:
+								return updated_node
 
-				return replacement
+					return replacement
 
 		return updated_node
 
-	# TODO: only update when inside a `libcst.Annotation` or in an expression
+	# TODO: only update if `self.inside_type_annotation` or in an expression
 	#       that uses things from `typing` so they're probably type vars
 	def leave_BinaryOperation(
 		self, original_node: libcst.BinaryOperation, updated_node: libcst.BinaryOperation
@@ -159,30 +180,39 @@ class Run(VisitorBasedCodemodCommand):
 	def leave_Name(
 		self, original_node: libcst.Name, updated_node: libcst.Name
 	) -> libcst.CSTNode:
-		# TODO: lookup `updated_node.value` in imports to find the fully-qualified name (e.g. `List` -> `typing.List`)
-		qualified_name = updated_node.value
-
-		self.node_to_qualified_name[updated_node] = (qualified_name,)
-		return updated_node
+		return self.leave_Name_or_Attribute(original_node, updated_node)
 
 	def leave_Attribute(
 		self, original_node: libcst.Attribute, updated_node: libcst.Attribute
 	) -> libcst.CSTNode:
-		lhs_qualified_name = self.node_to_qualified_name.get(updated_node.value)
-		if lhs_qualified_name:
-			qualified_name = (*lhs_qualified_name, updated_node.attr.value)
-			self.node_to_qualified_name[updated_node] = qualified_name
+		return self.leave_Name_or_Attribute(original_node, updated_node)
 
-			replacement_qualified_name = DEPRECATED_TYPES_REPLACEMENTS.get('.'.join(qualified_name))
-			if replacement_qualified_name:
-				# TODO: reuse existing imports for part of the qualified name if possible,
-				#       e.g. if we need `collections.abc.Container` and there's `from collections import abc` then use `abc.Container`
-				replacement_module_name, _, replacement_name = replacement_qualified_name.rpartition('.')
+	def leave_Name_or_Attribute(
+		self, original_node: libcst.Name | libcst.Attribute, updated_node: libcst.Name | libcst.Attribute
+	) -> libcst.CSTNode:
+		try:
+			scope = self.get_metadata(ScopeProvider, original_node)
+		except Exception:
+			# we're inside an `import` statement
+			return updated_node
 
-				# for builtins this will be empty, otherwise we need to import
-				if replacement_module_name:
-					AddImportsVisitor.add_needed_import(self.context, replacement_module_name, replacement_name)
+		qualified_name = get_qualified_imported_name(scope, updated_node)
+		if not qualified_name:
+			return updated_node
 
-				return libcst.Name(replacement_name)
+		replacement_qualified_name = DEPRECATED_TYPES_REPLACEMENTS.get(qualified_name)
+		if not replacement_qualified_name:
+			return updated_node
 
-		return updated_node
+		# TODO: reuse existing imports for part of the qualified name if possible,
+		#       e.g. if we need `collections.abc.Container` and there's `from collections import abc` then use `abc.Container`
+		replacement_module_name, _, replacement_name = replacement_qualified_name.rpartition('.')
+
+		# for builtins this will be empty, otherwise we need to import
+		if replacement_module_name:
+			if self.inside_type_annotation:
+				# TODO: add the import inside an `if TYPE_CHECKING` (and add the `if` if it doesn't exist)
+				pass
+			AddImportsVisitor.add_needed_import(self.context, replacement_module_name, replacement_name)
+
+		return libcst.Name(replacement_name)
